@@ -13,27 +13,67 @@
 #define cbi(a, b) ((a) &= ~(1 << (b)))    //clears bit B in variable A
 #define tbi(a, b) ((a) ^= 1 << (b))       //toggles bit B in variable A
 
+volatile uint8_t led = 0;
+volatile uint8_t count = 0;
+
+
+#define NUM_ADC_READ      2
+#define ADC_WHEEL_POS     0
+#define ADC_CURRENT_SENSE 1
+
+volatile uint8_t adc_index     = 0;
+volatile uint8_t wheel_pos     = 0;
+volatile uint8_t current_sense = 0;
+
+ISR (TIMER2_OVF_vect)
+{
+    if ((ADCSRA & (1<<ADSC)) != 0)
+        return;
+
+    ADMUX &= 0xF8;
+    ADMUX |= adc_index;
+    ADCSRA |= (1<<ADSC)|(1<<ADIE);
+}
+
+ISR(ADC_vect)
+{
+    uint8_t val, dummy;
+
+    dummy = ADCL;
+    val = ADCH;
+
+    if (adc_index == ADC_WHEEL_POS)
+        wheel_pos = val;
+    else
+    if (adc_index == ADC_CURRENT_SENSE)
+        current_sense = val;
+
+    adc_index = (adc_index + 1) % NUM_ADC_READ;
+}
+
+void timer_setup(void)
+{
+    TCCR2B |= _BV(CS22) | _BV(CS21) | _BV(CS20);
+	TCNT2 = 0;
+    TIMSK2 |= _BV(TOIE2);
+}
+
 void pwm_setup(void)
 {
 	/* Set to Fast PWM */
 	TCCR0A |= _BV(WGM01) | _BV(WGM00);
-	TCCR2A |= _BV(WGM21) | _BV(WGM20);
 
 	// Set the compare output mode
 	TCCR0A |= _BV(COM0A1);
 	TCCR0A |= _BV(COM0B1);
-	TCCR2A |= _BV(COM2B1);
 
 	// Reset timers and comparators
 	OCR0A = 0;
 	OCR0B = 0;
-	OCR2B = 0;
 	TCNT0 = 0;
-	TCNT2 = 0;
 
     // Set the clock source
 	TCCR0B |= _BV(CS00);
-	TCCR2B |= _BV(CS20);
 
     // Set PWM pins as outputs
     DDRD |= (1<<PD6)|(1<<PD5)|(1<<PD3);
@@ -46,9 +86,9 @@ void flash_led(void)
 
     for(i = 0; i < 3; i++)
     {
-        sbi(PORTC, 5);
+        sbi(PORTB, 5);
         _delay_ms(100); 
-        cbi(PORTC, 5);
+        cbi(PORTB, 5);
         _delay_ms(100); 
     }
 }
@@ -89,10 +129,8 @@ void motor_speed(uint8_t motor, uint8_t speed, uint8_t dir)
         cbi(PORTB, 0);
 
     if (motor == 0)
-        OCR2B = speed;
-    if (motor == 1)
         OCR0A = speed;
-    if (motor == 2)
+    if (motor == 1)
         OCR0B = speed;
 }
 
@@ -112,18 +150,21 @@ void ramp(uint8_t motor, uint8_t dir, uint8_t from, uint8_t to, uint8_t ms_per_s
     }
 }
 
-uint8_t home(uint8_t motor)
+void home(uint8_t motor)
 {
-    uint8_t a;
+    uint8_t cs;
 
     // Bring the motor in until the current sensor kicks in
     motor_speed(motor, 64, 0);
     while(1)
     {
-        a = adc_read(3);
-        if (a < 95)
+        cli();
+        cs = current_sense;
+        sei();
+
+        if (cs < 95)
             break;
-        _delay_ms(100); 
+        _delay_ms(50); 
     }
     motor_speed(motor, 0, 0);
 
@@ -131,7 +172,6 @@ uint8_t home(uint8_t motor)
     motor_speed(motor, 32, 1);
 	_delay_ms(200); 
     motor_speed(motor, 0, 1);
-    return adc_read(0);
 }
 
 #define MAX_REV 242
@@ -144,17 +184,14 @@ void wait_distance_out(int16_t distance)
     last = adc_read(0);
     while(total < distance)
     {
-        dprintf("cur: %d last: %d total: %d\n", cur, last, total);
         cur = adc_read(0);
         if (abs(cur - last) < 2)
             continue;
         if (cur < last)
         {
-            dprintf("Wrapped! adj total: %d\n", MAX_REV - last);
             total += MAX_REV - last;
             last = MIN_REV;
         }
-        dprintf("inc: %d\n", cur - last);
         total += cur - last;
 
         last = cur;
@@ -185,27 +222,37 @@ void wait_distance_in(int16_t distance)
 
 int main(void)
 {
-    uint8_t a, s, home_pos;
+    uint8_t a, s;
 
     serial_init();
     adc_setup();
     pwm_setup();
+    timer_setup();
 
     // Pin 2 (PD2) is current sense
     // Pin 3 is PWM out
     // Pin 8 (PB0) is the motor direction.
-    DDRB |= (1<<PB0);
+    // Pin 13 (PB5) is the on board LED
+    DDRB |= (1<<PB0) | (1 << PB5);
 
+    flash_led();
+
+    sei();
     dprintf("poibot starting!\n");
     dprintf("Reset to home...");
-    home_pos = home(0);
+    home(0);
+
+    while(1)
+    {
+        dprintf("pos: %d cs: %d\n", wheel_pos, current_sense);
+        _delay_ms(250);
+    }
 
     s = 32;
 	while (1)
     {
         // Start letting out chain and ramp speed up
         //ramp(0, 1, 0, s, 2);
-
 
 
         motor_speed(0, 32, 1);
