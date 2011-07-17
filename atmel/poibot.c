@@ -1,4 +1,4 @@
-#include <avr/io.h>
+minclude <avr/io.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <math.h>
@@ -12,6 +12,7 @@
 #define sbi(a, b) ((a) |= 1 << (b))       //sets bit B in variable A
 #define cbi(a, b) ((a) &= ~(1 << (b)))    //clears bit B in variable A
 #define tbi(a, b) ((a) ^= 1 << (b))       //toggles bit B in variable A
+#define MAX(a,b) ((a) > (b) ? (a) : (b))
 
 #define NUM_ADC_READ      3
 #define ADC_WHEEL_POS     0
@@ -21,7 +22,10 @@
 #define MELEXUS_MAX         242
 #define MELEXUS_MIN         13
 
-#define ROTATION_OFFSET   .296
+#define ROTATION_OFFSET_BOTTOM   .296
+#define ROTATION_OFFSET_TOP      -.203
+
+#define CURRENT_SENSE_THRESHOLD 88
 
 volatile uint8_t  adc_index     = 0;
 volatile uint16_t wheel_dist    = 0;
@@ -32,7 +36,13 @@ volatile uint8_t  wheel_pos     = 0;
 volatile uint8_t  last_wheel_pos= 0;
 volatile uint8_t  home_pos      = 0;
 
-volatile float    wheel_rotation     = 0;
+volatile float    last_wheel_rotation      = 0;
+volatile float    wheel_rotation           = 0;
+volatile uint8_t  wheel_rotation_updated   = 0; 
+volatile int8_t   wheel_rotation_direction = 0; 
+
+void motor_speed(uint8_t motor, uint8_t speed, uint8_t dir);
+
 
 ISR (TIMER2_OVF_vect)
 {
@@ -72,9 +82,22 @@ ISR(ADC_vect)
     else
     if (adc_index == ADC_ROTATION)
     {
-        float r = ((float)(val - MELEXUS_MIN) / (float)(MELEXUS_MAX - MELEXUS_MIN));
-        r -= ROTATION_OFFSET;
-        wheel_rotation = (r < 0.0) ? 1.0 + r : r;
+        // For 0 at bottom
+        //float r = ((float)(val - MELEXUS_MIN) / (float)(MELEXUS_MAX - MELEXUS_MIN));
+        //r -= ROTATION_OFFSET_BOTTOM;
+        //wheel_rotation = (r < 0.0) ? -r : 1.0 - r;
+
+        // For 0 at top
+        float r = ((float)(MELEXUS_MAX - val) / (float)(MELEXUS_MAX - MELEXUS_MIN));
+        r += ROTATION_OFFSET_TOP;
+        r = (r < 0.0) ? r + 1.0 : r;
+        if (r != wheel_rotation)
+        {
+            wheel_rotation_updated = 1;
+            wheel_rotation_direction = (last_wheel_rotation < wheel_rotation) ? 1 : -1;
+            last_wheel_rotation = wheel_rotation;
+            wheel_rotation = r;
+        }
     }
 
     adc_index = (adc_index + 1) % NUM_ADC_READ;
@@ -91,12 +114,35 @@ uint16_t get_wheel_dist(void)
     return t;
 }
 
+uint8_t was_rotation_updated(void)
+{
+    uint8_t u;
+
+    cli();
+    u = wheel_rotation_updated;
+    sei();
+
+    return u;
+}
+
+int8_t get_rotation_dir(void)
+{
+    uint8_t d;
+
+    cli();
+    d = (wheel_rotation > last_wheel_rotation) ? 1 : -1;
+    sei();
+
+    return d;
+}
+
 int16_t get_rotation_deg(void)
 {
     float r;
 
     cli();
     r = wheel_rotation;
+    wheel_rotation_updated = 0;
     sei();
 
     return (int)(r * 360);
@@ -108,15 +154,36 @@ float get_rotation_rad(void)
 
     cli();
     r = wheel_rotation;
+    wheel_rotation_updated = 0;
     sei();
 
-    return (int)(r * M_PI * 2.0);
+    return r * M_PI * 2.0;
+}
+
+void current_sense_check(void)
+{
+    uint8_t cs;
+
+    cli();
+    cs = current_sense;
+    sei();
+
+    if (cs > 70)
+        return;
+
+    dprintf("current panic %d\n", cs);
+
+//    motor_speed(0, 0, 0);
+//    dprintf("current panic -- stopped!\n");
+//    while(1)
+//        _delay_ms(100);
 }
 
 void home(uint8_t motor)
 {
     uint8_t cs;
 
+    dprintf("Reset to home...\n");
     // Bring the motor in until the current sensor kicks in
     motor_speed(motor, 64, 0);
     while(1)
@@ -124,19 +191,23 @@ void home(uint8_t motor)
         cli();
         cs = current_sense;
         sei();
-        dprintf("cs: %d\n", cs);
+        dprintf("  current sense: %d\n", cs);
 
-        if (cs < 88)
+        if (cs < CURRENT_SENSE_THRESHOLD)
             break;
         _delay_ms(50); 
     }
-    motor_speed(motor, 0, 0);
 
     cli();
     home_pos = wheel_pos;
     rotations = 0;
     sei();
-    dprintf("\nHome pos: %d\n", home_pos);
+
+    motor_speed(motor, 64, 1);
+    _delay_ms(250);
+    _delay_ms(250);
+    _delay_ms(250);
+    motor_speed(motor, 0, 0);
 }
 
 void timer_setup(void)
@@ -229,7 +300,10 @@ void go_to(uint8_t motor, uint8_t speed, uint16_t dist)
         dprintf("go forward from %d to %d\n", get_wheel_dist(), dist);
         motor_speed(motor, speed, 1);
         while(get_wheel_dist() < dist)
+        {
+            current_sense_check();
             _delay_ms(2);
+        }
         //dprintf("wheel: %d dist: %d\n", get_wheel_dist(), dist);
     }
     else
@@ -237,7 +311,10 @@ void go_to(uint8_t motor, uint8_t speed, uint16_t dist)
         dprintf("go backward from %d to %d\n", get_wheel_dist(), dist);
         motor_speed(motor, speed, 0);
         while(get_wheel_dist() > dist)
+        {
+            current_sense_check();
             _delay_ms(2);
+        }
     }
     motor_speed(motor, 0, 1); 
     dprintf("arrived at %d\n\n", get_wheel_dist());
@@ -259,10 +336,33 @@ void ramp(uint8_t motor, uint8_t dir, uint8_t from, uint8_t to, uint8_t ms_per_s
     }
 }
 
+/*
+
+Implementation notes:
+
+Oscillating phase:
+- wait for poi to be pushed past 20deg
+- keep track of max theta and adjust theta0 (on both sides of the swing)
+- keep track of delta theta for last swing
+- wait for theta to change and then:
+  - calculate l
+  - compare to current_dist, and adjust motor speed 
+  - how do you adjust motor speed? 
+     - chain length off by x%, adjust the motor speed by x%
+     - dream up others if this doesn't work! 
+- keep increasing energy until t0 is greater than 90deg from vertical. 
+- go idle when delta theta is less than 3 degrees.
+*/
+
+#define START 160
+#define END   180
+
 int main(void)
 {
-    uint8_t a, s;
-    uint16_t h;
+    uint8_t  s, i;
+    int8_t   swing_dir, last_swing_dir = 0;
+    float    theta0, theta, ltheta, k, l, l0;
+    int16_t  deg, last_deg;
 
     serial_init();
 
@@ -275,9 +375,7 @@ int main(void)
     // Pin 6 is PWM out
     // Pin 8 (PB0) is the motor direction.
     // Pin 13 (PB5) is the on board LED
-    // Pin A5 (PC5) is the Vcc for the rotatinal melexus
     DDRB |= (1<<PB0) | (1 << PB5);
-    DDRC |= (1<<PC5);
 
     sbi(PORTD, 5);
 
@@ -285,8 +383,8 @@ int main(void)
 
     sei();
     dprintf("poibot starting!\n");
-    dprintf("Reset to home...");
     home(0);
+    dprintf("poibot ready!\n");
 
 //    while(1)
 //    {
@@ -295,14 +393,100 @@ int main(void)
 //    }
 
     s = 32;
-    h = wheel_dist;
-	while (1)
+    l0 = get_wheel_dist();
+    k = 10.0;
+    while(1)
     {
-        // Start letting out chain and ramp speed up
-        //ramp(0, 1, 0, s, 2);
+        while (0)
+        {
+            while(!was_rotation_updated());
+            deg = get_rotation_deg();
+            dprintf("%d\n", deg);
+        }
+        dprintf("go home\n");
+        go_to(0, 45, l0);
+        dprintf("Waiting for someone to give me a push!\n");
+        theta0 = theta = 0.0;
+        for(;;)
+        {
+            _delay_ms(10);
+            theta = get_rotation_rad();
+            if (theta < theta0 && theta0 > 3.52 && theta0 < 4.37)
+                break;
 
-        dprintf("%d\n", get_rotation_deg());
-        _delay_ms(100);
+            if (theta < M_PI)
+                theta0 = 0.0;
+
+            theta0 = theta > theta0 ? theta : theta0;
+            //dprintf("rot: %d t: %f t0: %f\n", get_rotation_deg(), theta, theta0);
+        }
+        //dprintf("start theta theta0: %f\n", theta0);
+        dprintf("l0: %d\n", l0);
+        while (1)
+        {
+            while(!was_rotation_updated());
+            deg = get_rotation_deg();
+            swing_dir = get_rotation_dir();
+
+            if (deg > 240 || deg < 120)
+                break;
+
+            if (swing_dir > 0 && deg < START)
+            {
+                do
+                {
+                    while(!was_rotation_updated());
+                    deg = get_rotation_deg();
+                }
+                while(deg < START);
+
+                go_to(0, 60, l0 - 20);
+            }
+
+            if (swing_dir < 0 && deg > END)
+            {
+                do
+                {
+                    while(!was_rotation_updated());
+                    deg = get_rotation_deg();
+                }
+                while(deg > END);
+
+                go_to(0, 45, l0);
+            }
+            last_swing_dir = swing_dir;
+        }
+        // Wait for it to calm down
+        last_deg = deg;
+        while (1)
+        {
+            while(!was_rotation_updated());
+            deg = get_rotation_deg();
+            if (deg < 183 && deg > 176 && last_deg < 183 && last_deg > 176)
+            {
+                dprintf("Stopped!\n");
+                break;
+            }
+            last_deg = deg;
+        }
+    }
+    while(0)
+    {
+
+        ltheta = 100.0;
+        for(;;)
+        {
+            theta = get_rotation_rad();
+            dprintf("lt: %f t: %f\n", ltheta, theta);
+            if (fabs(ltheta - theta) < .01)
+                break;
+
+            l = l0 + (k * sin (M_PI/theta0 * theta));
+            _delay_ms(50);
+            dprintf("%f t: %f\n", l, theta);
+
+            ltheta = theta;
+        }
     }
 
 	return 0;
