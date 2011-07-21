@@ -4,7 +4,7 @@ OBJ2HEX=avr-objcopy
 TARGET=poibot
 
 program: $(TARGET).hex 
-	sudo avrdude -p m328p -P usb -c avrispmkII -Uflash:w:$(TARGET).hex -B 1.0
+	sudo avrdude -p m328p -P usb -c avrispmkII -Uflash:w:$(TARGET).hex
 
 $(TARGET).hex: $(TARGET).obj
 	$(OBJ2HEX) -R .eeprom -O ihex $< $@
